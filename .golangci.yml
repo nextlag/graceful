@@ -1,0 +1,89 @@
+version: "2"
+run:
+  concurrency: 4
+  go: "1.24"
+  modules-download-mode: mod
+  issues-exit-code: 1
+  tests: true
+  allow-parallel-runners: true
+linters:
+  default: all
+  disable:
+    - exhaustruct
+    - musttag
+    - nolintlint
+    - nonamedreturns
+    - tagliatelle
+    - wrapcheck
+    - lll
+  settings:
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          files:
+            - $all
+          allow:
+            - $gostd
+            - filippo.io/edwards25519
+            - golang.org/x/crypto
+          deny:
+            - pkg: io/ioutil
+              desc: 'replaced by io and os packages since Go 1.16: https://tip.golang.org/doc/go1.16#ioutil'
+    funlen:
+      lines: 100
+      statements: 50
+      ignore-comments: true
+    gosec:
+      excludes:
+        - G401
+        - G505
+        - G306
+    lll:
+      line-length: 140
+    misspell:
+      ignore-rules:
+        - sub_payed
+    varnamelen:
+      ignore-names:
+        - ok
+        - bs
+        - err
+        - tx
+        - id
+        - wg
+        - i
+        - db
+        - fn
+        - r
+        - w
+        - rw
+        - tt
+    whitespace:
+      multi-if: true
+      multi-func: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - lll
+        source: '.*// '
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
