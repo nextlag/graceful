@@ -5,7 +5,14 @@ import (
 	"os"
 )
 
-var ErrShutdownRequested = errors.New("shutdown requested")
+var (
+	// ErrShutdownRequested is the context cause when shutdown is started by Shutdown.
+	ErrShutdownRequested = errors.New("shutdown requested")
+	// ErrShutdownStarted is returned by Register once shutdown has started.
+	ErrShutdownStarted = errors.New("shutdown already started")
+	// ErrNilSubscriber is returned by Register for a nil subscriber.
+	ErrNilSubscriber = errors.New("nil subscriber")
+)
 
 // SignalError is the context cause when shutdown is started by a signal.
 type SignalError struct {
@@ -13,5 +20,11 @@ type SignalError struct {
 }
 
 func (e SignalError) Error() string {
-	return "received signal " + e.Signal.String()
+	const msg = "received signal"
+
+	if e.Signal == nil {
+		return msg
+	}
+
+	return msg + " " + e.Signal.String()
 }

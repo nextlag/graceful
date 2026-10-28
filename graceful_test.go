@@ -3,12 +3,14 @@ package graceful_test
 import (
 	"context"
 	"errors"
-	"os/signal"
+	"os"
+	"runtime"
+	"slices"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
+	"weak"
 
 	"github.com/nextlag/graceful"
 )
@@ -33,6 +35,14 @@ func (m *mockSubscriber) OnShutdown(ctx context.Context) error {
 	return nil
 }
 
+type subscriberFunc func(ctx context.Context) error
+
+func (f subscriberFunc) OnShutdown(ctx context.Context) error {
+	return f(ctx)
+}
+
+type ctxKey struct{}
+
 func newNotifier(t *testing.T, opts ...graceful.Option) (*graceful.ShutdownNotifier, context.Context) {
 	t.Helper()
 
@@ -44,6 +54,17 @@ func newNotifier(t *testing.T, opts ...graceful.Option) (*graceful.ShutdownNotif
 	})
 
 	return notifier, ctx
+}
+
+func register(t *testing.T, notifier *graceful.ShutdownNotifier, sub graceful.Subscriber) func() {
+	t.Helper()
+
+	unregister, err := notifier.Register(sub)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	return unregister
 }
 
 func waitShutdown(t *testing.T, notifier *graceful.ShutdownNotifier) {
@@ -62,34 +83,116 @@ func TestRegisterAndUnregister(t *testing.T) {
 		notifier, _ := newNotifier(t)
 		kept, removed := &mockSubscriber{}, &mockSubscriber{}
 
-		notifier.Register(kept)
-		notifier.Register(removed)
+		register(t, notifier, kept)
 
-		if got := notifier.SubscriberCount(); got != 2 {
+		unregister := register(t, notifier, removed)
+
+		got := notifier.SubscriberCount()
+		if got != 2 {
 			t.Fatalf("SubscriberCount() = %d, want 2", got)
 		}
 
-		notifier.Unregister(removed)
-		notifier.Unregister(&mockSubscriber{})
+		unregister()
+		unregister()
 
-		if got := notifier.SubscriberCount(); got != 1 {
-			t.Fatalf("SubscriberCount() after Unregister = %d, want 1", got)
+		got = notifier.SubscriberCount()
+		if got != 1 {
+			t.Fatalf("SubscriberCount() after unregister = %d, want 1", got)
 		}
 
 		notifier.Shutdown()
+		waitShutdown(t, notifier)
 
-		if err := notifier.Wait(); err != nil {
-			t.Fatalf("Wait() error = %v", err)
+		keptCalls := kept.callCount.Load()
+		if keptCalls != 1 {
+			t.Errorf("kept subscriber calls = %d, want 1", keptCalls)
 		}
 
-		if got := kept.callCount.Load(); got != 1 {
-			t.Errorf("kept subscriber calls = %d, want 1", got)
-		}
-
-		if got := removed.callCount.Load(); got != 0 {
-			t.Errorf("removed subscriber calls = %d, want 0", got)
+		removedCalls := removed.callCount.Load()
+		if removedCalls != 0 {
+			t.Errorf("removed subscriber calls = %d, want 0", removedCalls)
 		}
 	})
+}
+
+func TestUnregisterUncomparableSubscriber(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		notifier, _ := newNotifier(t)
+
+		unregister := register(t, notifier, subscriberFunc(func(context.Context) error { return nil }))
+		unregister()
+
+		got := notifier.SubscriberCount()
+		if got != 0 {
+			t.Errorf("SubscriberCount() after unregister = %d, want 0", got)
+		}
+	})
+}
+
+func TestUnregisterReleasesSubscriber(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		notifier, _ := newNotifier(t)
+		register(t, notifier, &mockSubscriber{})
+
+		ptr := registerAndUnregister(t, notifier)
+
+		runtime.GC()
+
+		if ptr.Value() != nil {
+			t.Error("unregister kept a reference to the removed subscriber")
+		}
+	})
+}
+
+func registerAndUnregister(t *testing.T, notifier *graceful.ShutdownNotifier) weak.Pointer[mockSubscriber] {
+	t.Helper()
+
+	sub := &mockSubscriber{}
+	register(t, notifier, sub)()
+
+	return weak.Make(sub)
+}
+
+func TestRegisterFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		sub      graceful.Subscriber
+		shutdown bool
+		want     error
+	}{
+		{name: "nil subscriber", sub: nil, want: graceful.ErrNilSubscriber},
+		{name: "after shutdown started", sub: &mockSubscriber{}, shutdown: true, want: graceful.ErrShutdownStarted},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				notifier, _ := newNotifier(t)
+
+				if tt.shutdown {
+					notifier.Shutdown()
+				}
+
+				_, err := notifier.Register(tt.sub)
+				if !errors.Is(err, tt.want) {
+					t.Errorf("Register() error = %v, want %v", err, tt.want)
+				}
+
+				got := notifier.SubscriberCount()
+				if got != 0 {
+					t.Errorf("SubscriberCount() = %d, want 0", got)
+				}
+			})
+		})
+	}
 }
 
 func TestShutdownNotifiesSubscribersOnce(t *testing.T) {
@@ -98,7 +201,7 @@ func TestShutdownNotifiesSubscribersOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		notifier, _ := newNotifier(t)
 		sub := &mockSubscriber{}
-		notifier.Register(sub)
+		register(t, notifier, sub)
 
 		for range 10 {
 			go notifier.Shutdown()
@@ -107,8 +210,35 @@ func TestShutdownNotifiesSubscribersOnce(t *testing.T) {
 		waitShutdown(t, notifier)
 		notifier.Shutdown()
 
-		if got := sub.callCount.Load(); got != 1 {
+		got := sub.callCount.Load()
+		if got != 1 {
 			t.Errorf("subscriber calls = %d, want 1", got)
+		}
+	})
+}
+
+func TestSubscribersStopInReverseOrder(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		notifier, _ := newNotifier(t)
+
+		var order []int
+
+		for i := range 3 {
+			register(t, notifier, &mockSubscriber{onShutdownFunc: func(context.Context) error {
+				order = append(order, i)
+
+				return nil
+			}})
+		}
+
+		notifier.Shutdown()
+		waitShutdown(t, notifier)
+
+		want := []int{2, 1, 0}
+		if !slices.Equal(order, want) {
+			t.Errorf("shutdown order = %v, want %v", order, want)
 		}
 	})
 }
@@ -153,7 +283,7 @@ func TestStateWhileSubscribersRun(t *testing.T) {
 			ctxErr             error
 		)
 
-		notifier.Register(&mockSubscriber{onShutdownFunc: func(context.Context) error {
+		register(t, notifier, &mockSubscriber{onShutdownFunc: func(context.Context) error {
 			shuttingDown = notifier.IsShuttingDown()
 			ctxErr = ctx.Err()
 
@@ -193,15 +323,30 @@ func TestSubscriberMayCallNotifier(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		notifier, _ := newNotifier(t)
 
-		notifier.Register(&mockSubscriber{onShutdownFunc: func(context.Context) error {
-			notifier.Register(&mockSubscriber{})
-			notifier.SubscriberCount()
+		var (
+			unregister  func()
+			registerErr error
+		)
+
+		unregister = register(t, notifier, &mockSubscriber{onShutdownFunc: func(context.Context) error {
+			_, registerErr = notifier.Register(&mockSubscriber{})
+
+			unregister()
 
 			return nil
 		}})
 
 		notifier.Shutdown()
 		waitShutdown(t, notifier)
+
+		if !errors.Is(registerErr, graceful.ErrShutdownStarted) {
+			t.Errorf("Register() inside OnShutdown error = %v, want %v", registerErr, graceful.ErrShutdownStarted)
+		}
+
+		got := notifier.SubscriberCount()
+		if got != 0 {
+			t.Errorf("SubscriberCount() = %d, want 0", got)
+		}
 	})
 }
 
@@ -210,11 +355,11 @@ func TestWaitReturnsSubscriberErrors(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		notifier, _ := graceful.New(t.Context(), graceful.WithSignals())
-		failing := &mockSubscriber{onShutdownFunc: func(context.Context) error { return errShutdownFailed }}
 		succeeding := &mockSubscriber{}
+		failing := &mockSubscriber{onShutdownFunc: func(context.Context) error { return errShutdownFailed }}
 
-		notifier.Register(failing)
-		notifier.Register(succeeding)
+		register(t, notifier, succeeding)
+		register(t, notifier, failing)
 
 		notifier.Shutdown()
 
@@ -223,7 +368,8 @@ func TestWaitReturnsSubscriberErrors(t *testing.T) {
 			t.Errorf("Wait() error = %v, want %v", err, errShutdownFailed)
 		}
 
-		if got := succeeding.callCount.Load(); got != 1 {
+		got := succeeding.callCount.Load()
+		if got != 1 {
 			t.Errorf("subscriber after failing one calls = %d, want 1", got)
 		}
 	})
@@ -254,7 +400,12 @@ func TestTimeoutIsSharedBySubscribers(t *testing.T) {
 					secondErr  error
 				)
 
-				notifier.Register(&mockSubscriber{onShutdownFunc: func(ctx context.Context) error {
+				register(t, notifier, &mockSubscriber{onShutdownFunc: func(ctx context.Context) error {
+					secondErr = ctx.Err()
+
+					return nil
+				}})
+				register(t, notifier, &mockSubscriber{onShutdownFunc: func(ctx context.Context) error {
 					deadline, ok := ctx.Deadline()
 					if !ok {
 						t.Error("OnShutdown ctx has no deadline")
@@ -263,11 +414,6 @@ func TestTimeoutIsSharedBySubscribers(t *testing.T) {
 					gotTimeout = deadline.Sub(start)
 
 					<-ctx.Done()
-
-					return nil
-				}})
-				notifier.Register(&mockSubscriber{onShutdownFunc: func(ctx context.Context) error {
-					secondErr = ctx.Err()
 
 					return nil
 				}})
@@ -287,6 +433,69 @@ func TestTimeoutIsSharedBySubscribers(t *testing.T) {
 	}
 }
 
+func TestNonPositiveTimeoutMeansNoDeadline(t *testing.T) {
+	t.Parallel()
+
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				notifier, _ := newNotifier(t, graceful.WithTimeout(timeout))
+
+				var (
+					hasDeadline bool
+					ctxErr      error
+				)
+
+				register(t, notifier, &mockSubscriber{onShutdownFunc: func(ctx context.Context) error {
+					_, hasDeadline = ctx.Deadline()
+					ctxErr = ctx.Err()
+
+					return nil
+				}})
+
+				notifier.Shutdown()
+				waitShutdown(t, notifier)
+
+				if hasDeadline {
+					t.Error("OnShutdown ctx has a deadline, want none")
+				}
+
+				if ctxErr != nil {
+					t.Errorf("OnShutdown ctx.Err() = %v, want nil", ctxErr)
+				}
+			})
+		})
+	}
+}
+
+func TestSubscriberContextKeepsParentValues(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		const want = "value"
+
+		parent := context.WithValue(t.Context(), ctxKey{}, want)
+		notifier, _ := graceful.New(parent, graceful.WithSignals())
+
+		var got any
+
+		register(t, notifier, &mockSubscriber{onShutdownFunc: func(ctx context.Context) error {
+			got = ctx.Value(ctxKey{})
+
+			return nil
+		}})
+
+		notifier.Shutdown()
+		waitShutdown(t, notifier)
+
+		if got != want {
+			t.Errorf("ctx.Value() inside OnShutdown = %v, want %q", got, want)
+		}
+	})
+}
+
 func TestShutdownCause(t *testing.T) {
 	t.Parallel()
 
@@ -296,7 +505,8 @@ func TestShutdownCause(t *testing.T) {
 		notifier.Shutdown()
 		<-ctx.Done()
 
-		if got := context.Cause(ctx); !errors.Is(got, graceful.ErrShutdownRequested) {
+		got := context.Cause(ctx)
+		if !errors.Is(got, graceful.ErrShutdownRequested) {
 			t.Errorf("context.Cause() = %v, want %v", got, graceful.ErrShutdownRequested)
 		}
 	})
@@ -309,57 +519,43 @@ func TestParentCancelStartsShutdown(t *testing.T) {
 		parent, cancel := context.WithCancelCause(t.Context())
 		notifier, ctx := graceful.New(parent, graceful.WithSignals())
 		sub := &mockSubscriber{}
-		notifier.Register(sub)
+		register(t, notifier, sub)
 
 		cancel(errParentStopped)
 		waitShutdown(t, notifier)
 
-		if got := sub.callCount.Load(); got != 1 {
-			t.Errorf("subscriber calls = %d, want 1", got)
+		calls := sub.callCount.Load()
+		if calls != 1 {
+			t.Errorf("subscriber calls = %d, want 1", calls)
 		}
 
-		if got := context.Cause(ctx); !errors.Is(got, errParentStopped) {
-			t.Errorf("context.Cause() = %v, want %v", got, errParentStopped)
+		cause := context.Cause(ctx)
+		if !errors.Is(cause, errParentStopped) {
+			t.Errorf("context.Cause() = %v, want %v", cause, errParentStopped)
 		}
 	})
 }
 
-func TestDefaultSignalStartsShutdown(t *testing.T) {
-	notifier, ctx := graceful.New(t.Context())
-	sub := &mockSubscriber{}
-	notifier.Register(sub)
+func TestSignalErrorMessage(t *testing.T) {
+	t.Parallel()
 
-	err := syscall.Kill(syscall.Getpid(), syscall.SIGUSR1)
-	if err != nil {
-		t.Fatalf("Kill() error = %v", err)
+	tests := []struct {
+		name string
+		err  graceful.SignalError
+		want string
+	}{
+		{name: "with signal", err: graceful.SignalError{Signal: os.Interrupt}, want: "received signal interrupt"},
+		{name: "without signal", err: graceful.SignalError{Signal: nil}, want: "received signal"},
 	}
 
-	waitShutdown(t, notifier)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := sub.callCount.Load(); got != 1 {
-		t.Errorf("subscriber calls = %d, want 1", got)
+			got := tt.err.Error()
+			if got != tt.want {
+				t.Errorf("Error() = %q, want %q", got, tt.want)
+			}
+		})
 	}
-
-	var signalErr graceful.SignalError
-	if !errors.As(context.Cause(ctx), &signalErr) || signalErr.Signal != syscall.SIGUSR1 {
-		t.Errorf("context.Cause() = %v, want SignalError{SIGUSR1}", context.Cause(ctx))
-	}
-
-	if got, want := signalErr.Error(), "received signal "+syscall.SIGUSR1.String(); got != want {
-		t.Errorf("SignalError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestIgnoredSignalStaysIgnored(t *testing.T) {
-	signal.Ignore(syscall.SIGHUP)
-	t.Cleanup(func() { signal.Reset(syscall.SIGHUP) })
-
-	notifier, _ := graceful.New(t.Context(), graceful.WithSignals(syscall.SIGHUP))
-
-	if !signal.Ignored(syscall.SIGHUP) {
-		t.Error("New() stopped ignoring SIGHUP, want it to stay ignored")
-	}
-
-	notifier.Shutdown()
-	waitShutdown(t, notifier)
 }

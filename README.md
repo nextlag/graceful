@@ -3,7 +3,7 @@
 Graceful shutdown для Go-приложений.
 
 ```bash
-go get github.com/nextlag/graceful@v1.0.1
+go get github.com/nextlag/graceful@v1.1.0
 ```
 
 Go 1.25+.
@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"time"
@@ -42,44 +41,50 @@ func main() {
 }
 
 func run() error {
-	shutdown, ctx := graceful.New(context.Background(), graceful.WithTimeout(10*time.Second))
+	shutdown, _ := graceful.New(context.Background(), graceful.WithTimeout(10*time.Second))
 
-	server := &http.Server{
-		Addr:        ":8080",
-		BaseContext: func(net.Listener) context.Context { return ctx },
+	server := &http.Server{Addr: ":8080", ReadHeaderTimeout: 5 * time.Second}
+
+	_, err := shutdown.Register(httpServer{server})
+	if err != nil {
+		return err
 	}
-	shutdown.Register(httpServer{server})
+
+	serveErr := make(chan error, 1)
 
 	go func() {
+		defer close(serveErr)
+
 		err := server.ListenAndServe()
 		if !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("http server failed", slog.Any("err", err))
+			serveErr <- err
 			shutdown.Shutdown()
 		}
 	}()
 
-	return shutdown.Wait()
+	return errors.Join(shutdown.Wait(), <-serveErr)
 }
 ```
 
 ## Поведение
 
 - Остановку запускает первое из: сигнал, `Shutdown()`, отмена родительского `ctx`.
-- Сигналы по умолчанию: `SIGHUP`, `SIGINT`, `SIGTERM`, `SIGUSR1`. Игнорируемые процессом (`nohup`) не перехватываются.
+- Сигналы по умолчанию: unix — `SIGHUP`, `SIGINT`, `SIGTERM`, `SIGUSR1`; остальные ОС — `os.Interrupt`, `SIGTERM`. Игнорируемые процессом (`nohup`) не перехватываются.
+- Повторный сигнал во время остановки завершает процесс. Если остановка запущена не сигналом, первый сигнал во время неё поглощается.
 - Контекст из `New` отменяется в начале остановки. `context.Cause(ctx)`: `SignalError`, `ErrShutdownRequested` или причина родителя.
-- Подписчики вызываются по очереди в порядке регистрации, с общим таймаутом (30 с).
-- `Wait()` возвращает ошибки подписчиков через `errors.Join`.
+- Подписчики вызываются по очереди в обратном порядке регистрации, с общим таймаутом (30 с). Таймаут ≤ 0 — без ограничения. Контекст подписчика сохраняет значения родительского `ctx`, но не его отмену.
+- `Register` возвращает функцию отписки. После начала остановки `Register` возвращает `ErrShutdownStarted`, а отписка уже не отменяет вызов подписчика. Для `nil` — `ErrNilSubscriber`.
+- `Wait()` возвращает ошибки подписчиков через `errors.Join`. Из `OnShutdown` вызывать `Wait()` и ждать `Done()` нельзя - дедлок.
 
 ## API
 
 ```go
 func New(ctx context.Context, opts ...Option) (*ShutdownNotifier, context.Context)
 
-func WithSignals(signals ...os.Signal) Option 
+func WithSignals(signals ...os.Signal) Option
 func WithTimeout(timeout time.Duration) Option
 
-func (sn *ShutdownNotifier) Register(sub Subscriber)
-func (sn *ShutdownNotifier) Unregister(sub Subscriber)
+func (sn *ShutdownNotifier) Register(sub Subscriber) (func(), error)
 func (sn *ShutdownNotifier) SubscriberCount() int
 func (sn *ShutdownNotifier) Shutdown()
 func (sn *ShutdownNotifier) IsShuttingDown() bool
@@ -90,7 +95,11 @@ type Subscriber interface {
 	OnShutdown(ctx context.Context) error
 }
 
-var ErrShutdownRequested = errors.New("shutdown requested")
+var (
+	ErrShutdownRequested = errors.New("shutdown requested")
+	ErrShutdownStarted   = errors.New("shutdown already started")
+	ErrNilSubscriber     = errors.New("nil subscriber")
+)
 
 type SignalError struct {
 	Signal os.Signal
