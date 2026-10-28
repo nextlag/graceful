@@ -1,3 +1,3 @@
 module github.com/nextlag/graceful
 
-go 1.24.4
+go 1.27

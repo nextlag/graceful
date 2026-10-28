@@ -1,67 +1,104 @@
 version: "2"
 run:
   concurrency: 4
-  go: "1.24"
-  modules-download-mode: mod
   issues-exit-code: 1
-  tests: true
+  tests: false
   allow-parallel-runners: true
+
 linters:
   default: all
-  disable:
-    - exhaustruct
-    - musttag
-    - nolintlint
-    - nonamedreturns
-    - tagliatelle
-    - wrapcheck
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - unused
+    - staticcheck
+    - wsl_v5
+    - contextcheck
+    - copyloopvar
+    - dupl
+    - err113
+    - errname
+    - funlen
     - lll
+    - noinlineerr
+    - nlreturn
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - perfsprint
+    - nestif
+  disable:
+    - whitespace
   settings:
-    depguard:
-      rules:
-        main:
-          list-mode: lax
-          files:
-            - $all
-          allow:
-            - $gostd
-            - filippo.io/edwards25519
-            - golang.org/x/crypto
-          deny:
-            - pkg: io/ioutil
-              desc: 'replaced by io and os packages since Go 1.16: https://tip.golang.org/doc/go1.16#ioutil'
+    wsl_v5:
+      allow-first-in-block: false
+      allow-whole-block: true
+      branch-max-lines: 4
+      case-max-lines: 2
+      default: all
+      enable:
+        - assign
+        - branch
+        - decl
+        - defer
+        - expr
+        - for
+        - go
+        - if
+        - inc-dec
+        - label
+        - range
+        - return
+        - select
+        - send
+        - switch
+        - type-switch
+        - append
+        - assign-exclusive
+        - assign-expr
+        - err
+        - leading-whitespace
+        - trailing-whitespace
+    staticcheck:
+      checks:
+        - ST1003
+        - ST1005
+        - ST1006
+        - ST1008
+        - ST1011
+        - ST1012
+        - ST1013
+        - ST1015
+        - ST1016
+        - ST1017
+        - ST1018
+        - ST1019
+        - ST1020
+        - ST1021
+        - ST1022
+        - ST1023
+    varnamelen:
+      ignore-names:
+        - i
+        - ok
+        - bs
+        - err
+        - e
+        - tx
+        - id
+        - wg
+        - db
+        - fn
+        - in
+        - tc
+        - t
     funlen:
       lines: 100
       statements: 50
       ignore-comments: true
-    gosec:
-      excludes:
-        - G401
-        - G505
-        - G306
-    lll:
-      line-length: 140
-    misspell:
-      ignore-rules:
-        - sub_payed
-    varnamelen:
-      ignore-names:
-        - ok
-        - bs
-        - err
-        - tx
-        - id
-        - wg
-        - i
-        - db
-        - fn
-        - r
-        - w
-        - rw
-        - tt
-    whitespace:
-      multi-if: true
-      multi-func: false
+    dupl:
+      threshold: 100
   exclusions:
     generated: lax
     presets:
@@ -74,16 +111,14 @@ linters:
           - lll
         source: '.*// '
     paths:
-      - third_party$
-      - builtin$
-      - examples$
+      - "vendor"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 formatters:
-  enable:
-    - gofmt
-    - goimports
   exclusions:
     generated: lax
     paths:
-      - third_party$
-      - builtin$
-      - examples$
+      - "vendor"

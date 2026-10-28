@@ -1,0 +1,164 @@
+version: '3'
+
+vars:
+  MODULE:
+    sh: head -n 1 go.mod | awk -F ' ' '{print $2}'
+  GOLANGCI_LINT_VERSION: 2.15.0
+  GOLANGCI_LINT: github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v{{.GOLANGCI_LINT_VERSION}}
+  GCI: github.com/daixiang0/gci@latest
+  GOFUMPT: mvdan.cc/gofumpt@latest
+  NILAWAY: go.uber.org/nilaway/cmd/nilaway@latest
+  CHANGED_GO_FILES:
+    sh: >-
+      { git diff --name-only --diff-filter=d -- "*.go";
+      git diff --name-only --diff-filter=d --cached -- "*.go";
+      git ls-files --others --exclude-standard -- "*.go"; }
+      | grep -v '^vendor/' | sort -u
+      | while read -r f; do [ -f "$f" ] && echo "$f"; done | tr '\n' ' '
+  CHANGED_GO_PKGS:
+    sh: for f in {{.CHANGED_GO_FILES}}; do dirname "$f"; done | sort -u | sed 's|^|./|' | tr '\n' ' '
+  CHANGED_GO_FILES_CSV:
+    sh: printf '%s' '{{.CHANGED_GO_FILES}}' | tr ' ' ',' | sed 's/,*$//'
+  REPORTS_DIR: .reports
+
+tasks:
+  default:
+    desc: Запуск всех проверок
+    cmds:
+      - task: format
+      - task: lint
+      - task: test
+
+  format:
+    desc: Автоформатирование изменённых файлов (go fix, gci, gofumpt)
+    silent: true
+    status:
+      - test -z "{{.CHANGED_GO_FILES}}"
+    cmds:
+      - cmd: |
+          before=$(cksum {{.CHANGED_GO_FILES}})
+
+          out=$({
+            go fix {{.CHANGED_GO_PKGS}} &&
+            go run {{.GCI}} write --skip-vendor --section standard --section default \
+              --section "prefix({{.MODULE}})" --custom-order {{.CHANGED_GO_FILES}} &&
+            go run {{.GOFUMPT}} -w {{.CHANGED_GO_FILES}}
+          } 2>&1) && rc=0 || rc=$?
+
+          if [ "$rc" != 0 ]; then
+            printf '%s\n' "$out"
+
+            exit "$rc"
+          fi
+
+          formatted=$(printf '%s\n%s\n' "$before" "$(cksum {{.CHANGED_GO_FILES}})" |
+            sort | uniq -u | awk '{print $NF}' | sort -u)
+
+          if [ -z "$formatted" ]; then
+            printf '\033[32m✓ форматтер не нашёл проблем\033[0m\n'
+
+            exit 0
+          fi
+
+          printf '%s\n' "$formatted" |
+            while read -r file; do printf '\033[33mотформатирован %s\033[0m\n' "$file"; done
+
+  ensure-lint:
+    desc: Установка линтеров, если нет нужной версии
+    silent: true
+    status:
+      - golangci-lint --version | grep -qF 'version {{.GOLANGCI_LINT_VERSION}}'
+      - which nilaway
+    cmds:
+      - go install {{.GOLANGCI_LINT}}
+      - go install {{.NILAWAY}}
+
+  lint:
+    desc: Запуск линтеров по изменённым файлам
+    silent: true
+    status:
+      - test -z "{{.CHANGED_GO_FILES}}"
+    cmds:
+      - task: ensure-lint
+      - cmd: |
+          out=$(golangci-lint run --modules-download-mode=vendor {{.CHANGED_GO_PKGS}} 2>&1) && rc=0 || rc=$?
+
+          if [ "$rc" != 0 ]; then
+            printf '%s\n' "$out"
+
+            exit "$rc"
+          fi
+
+          printf '\033[32m✓ линтер не нашёл проблем\033[0m\n'
+      - cmd: |
+          out=$(nilaway -include-errors-in-files "{{.CHANGED_GO_FILES_CSV}}" {{.CHANGED_GO_PKGS}} 2>&1) && rc=0 || rc=$?
+
+          if [ "$rc" != 0 ] || [ -n "$out" ]; then
+            printf '%s\n' "$out"
+
+            exit 1
+          fi
+
+          printf '\033[32m✓ nilaway не нашёл проблем\033[0m\n'
+
+  test:
+    desc: Тесты и покрытие по файлам, полный вывод по `task test -- -v`
+    silent: true
+    cmds:
+      - cmd: |
+          mkdir -p {{.REPORTS_DIR}}
+
+          args='{{.CLI_ARGS}}'
+
+          out=$(go test ./... -count=1 -race \
+            -coverpkg=./... -coverprofile={{.REPORTS_DIR}}/coverage.out \
+            $args 2>&1) && rc=0 || rc=$?
+
+          if [ -n "$args" ]; then
+            printf '%s\n' "$out"
+
+            exit "$rc"
+          fi
+
+          if [ "$rc" != 0 ]; then
+            if printf '%s\n' "$out" | grep -qE '^(panic:|fatal error:|#)|DATA RACE|\[build failed\]'; then
+              printf '%s\n' "$out"
+            else
+              printf '%s\n' "$out" | grep -E '^[[:space:]]*--- (FAIL|SKIP)|\.go:[0-9]+:|^FAIL[[:space:]]'
+            fi
+
+            exit "$rc"
+          fi
+      - cmd: |
+          report=$(awk -v module='{{.MODULE}}/' '
+            NR > 1 && $2 > 0 {
+              statements[$1] = $2
+              hits[$1] += $3
+            }
+            END {
+              for (block in statements) {
+                split(block, position, ":")
+                file = position[1]
+                sub(module, "", file)
+                total[file] += statements[block]
+                allTotal += statements[block]
+
+                if (hits[block] > 0) {
+                  covered[file] += statements[block]
+                  allCovered += statements[block]
+                }
+              }
+
+              printf "\033[1;32mtotal coverage: %.1f%%\033[0m\n", (allTotal > 0 ? 100 * allCovered / allTotal : 0)
+
+              for (file in total) printf "\033[32m%-58s %5.1f%%\033[0m\n", file, 100 * covered[file] / total[file]
+            }
+          ' {{.REPORTS_DIR}}/coverage.out)
+
+          printf '%s\n' "$report" | tail -n +2 | sort
+          printf '%s\n' "$report" | head -n 1
+
+  test:html:
+    desc: HTML-отчёт покрытия по профилю последнего прогона
+    cmds:
+      - go tool cover -html={{.REPORTS_DIR}}/coverage.out -o {{.REPORTS_DIR}}/coverage.html
